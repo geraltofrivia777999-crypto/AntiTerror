@@ -13,12 +13,12 @@ from .association import AssociationEngine
 from .behavior import BehaviorAnalyzer
 from .config import PipelineConfig, select_device
 from .detection import Detector
-from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder
+from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder, FaceQuality
 from .events import EventSink
 from .tracking import Tracker
 from .video import open_video_source, read_frame, release
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -29,6 +29,10 @@ class PersonState:
     pending_count: int = 0
     init_frames: int = 0
     last_seen: float = 0.0
+    # Quality tracking for adaptive EMA
+    best_quality: float = 0.0
+    quality_history: list = field(default_factory=list)  # List of recent quality scores
+    consecutive_low_quality: int = 0  # Track poor detections
 
 
 class Pipeline:
@@ -85,21 +89,58 @@ class Pipeline:
 
             pid = None
             px1, py1, px2, py2 = p.box
-            # pick best face inside person box
+            # pick best face inside person box - now includes quality
             candidates = []
-            for (fx1, fy1, fx2, fy2), fscore, femb, fcrop in faces:
+            for face_data in faces:
+                # New format: (bbox, score, embedding, face_crop, quality)
+                if len(face_data) == 5:
+                    (fx1, fy1, fx2, fy2), fscore, femb, fcrop, fquality = face_data
+                else:
+                    # Fallback for old format
+                    (fx1, fy1, fx2, fy2), fscore, femb, fcrop = face_data
+                    fquality = FaceQuality(detection_score=fscore)
+
                 if fx1 >= px1 and fy1 >= py1 and fx2 <= px2 and fy2 <= py2:
-                    candidates.append(((fx1, fy1, fx2, fy2), fscore, femb, fcrop))
+                    candidates.append(((fx1, fy1, fx2, fy2), fscore, femb, fcrop, fquality))
+
             if candidates:
-                (_, fscore, femb, fcrop) = max(candidates, key=lambda x: x[1])
-                # EMA embedding for stability
+                # Select face with best quality, not just detection score
+                best_candidate = max(candidates, key=lambda x: x[4].overall_quality)
+                (_, fscore, femb, fcrop, fquality) = best_candidate
+                quality_score = fquality.overall_quality
+
+                # Track quality for this person
+                state.quality_history.append(quality_score)
+                if len(state.quality_history) > 10:
+                    state.quality_history = state.quality_history[-10:]
+                state.best_quality = max(state.best_quality, quality_score)
+
+                # Adaptive EMA: weight by quality
+                # High quality faces have more influence on the embedding
+                ema_alpha = self.cfg.embeddings.ema_alpha
+                if self.cfg.embeddings.ema_quality_weighted:
+                    # Adjust alpha based on quality (higher quality = more weight to new)
+                    quality_factor = min(quality_score / 0.7, 1.0)  # normalize around 0.7
+                    new_weight = (1 - ema_alpha) * (0.5 + 0.5 * quality_factor)
+                    old_weight = 1 - new_weight
+                else:
+                    old_weight = ema_alpha
+                    new_weight = 1 - ema_alpha
+
                 if state.ema_emb is None:
                     state.ema_emb = femb
                 else:
-                    state.ema_emb = torch.nn.functional.normalize(0.8 * state.ema_emb + 0.2 * femb, dim=0)
+                    state.ema_emb = torch.nn.functional.normalize(
+                        old_weight * state.ema_emb + new_weight * femb, dim=0
+                    )
                 ref_emb = state.ema_emb
 
                 best_label, best_score = self.face_store.find_best(ref_emb)
+
+                # Get thresholds from config
+                similarity_thresh = self.cfg.embeddings.face_similarity_threshold
+                force_margin = self.cfg.embeddings.face_force_match_margin
+                create_thresh = self.cfg.embeddings.face_create_threshold
 
                 # Decide candidate label without creating new IDs eagerly
                 if state.label:
@@ -108,15 +149,20 @@ class Pipeline:
                     score_current = float(
                         torch.nn.functional.cosine_similarity(ref_emb.unsqueeze(0), ref_vec.unsqueeze(0)).item()
                     ) if ref_vec is not None else 0.0
-                    if score_current < self.cfg.embeddings.face_similarity_threshold - self.cfg.embeddings.face_force_match_margin:
-                        # consider switch if consistent over several frames
-                        if best_label and best_score >= self.cfg.embeddings.face_similarity_threshold - self.cfg.embeddings.face_force_match_margin:
+
+                    # Update store with new embedding (quality-weighted)
+                    self.face_store.add_embedding(state.label, femb, quality_score)
+
+                    if score_current < similarity_thresh - force_margin:
+                        # Consider switch only if consistent over several frames
+                        if best_label and best_label != state.label and best_score >= similarity_thresh - force_margin:
                             if state.pending_label == best_label:
                                 state.pending_count += 1
                             else:
                                 state.pending_label = best_label
                                 state.pending_count = 1
                             if state.pending_count >= self.cfg.embeddings.face_switch_patience_frames:
+                                logger.info(f"Switching ID from {state.label} to {best_label} (score: {best_score:.3f})")
                                 pid = best_label
                                 state.label = pid
                                 state.pending_label = None
@@ -125,48 +171,60 @@ class Pipeline:
                             state.pending_label = None
                             state.pending_count = 0
                 else:
-                    # no label yet, gate creation by patience and score
-                    if best_label and best_score >= self.cfg.embeddings.face_similarity_threshold:
+                    # No label yet - be very conservative about creating new IDs
+                    if best_label and best_score >= similarity_thresh:
+                        # Clear match - reuse existing ID
                         pid = best_label
                         state.label = pid
-                    elif best_label and best_score >= (self.cfg.embeddings.face_create_threshold - 0.05):
-                        # reuse existing best label even если чуть ниже create_threshold
+                        self.face_store.add_embedding(pid, femb, quality_score)
+                    elif best_label and best_score >= create_thresh:
+                        # Moderate match - still prefer existing ID to avoid duplicates
                         pid = best_label
                         state.label = pid
+                        self.face_store.add_embedding(pid, femb, quality_score)
+                        logger.debug(f"Reusing {best_label} with moderate score {best_score:.3f}")
                     else:
-                        # only create new ID if patience satisfied and score good enough
-                        if (
-                            state.init_frames >= self.cfg.embeddings.face_new_id_patience_frames
-                            and best_score >= self.cfg.embeddings.face_create_threshold
-                        ):
-                            label, created, _ = self.face_store.match_or_create(
-                                ref_emb,
-                                prefix="P",
-                                threshold=self.cfg.embeddings.face_similarity_threshold,
-                                force_threshold=self.cfg.embeddings.face_similarity_threshold
-                                - self.cfg.embeddings.face_force_match_margin,
-                                create_threshold=self.cfg.embeddings.face_create_threshold,
-                                image=fcrop,
-                                save_dir=self.cfg.persistence.faces_dir if self.cfg.persistence.save_faces else None,
-                            )
+                        # Low or no match - wait for patience frames before creating
+                        if state.init_frames >= self.cfg.embeddings.face_new_id_patience_frames:
                             now = time.time()
-                            if created and (now - self.last_person_creation_ts) < self.cfg.embeddings.face_new_id_cooldown_s and best_label:
-                                label = best_label
-                                created = False
-                            if created:
-                                self.last_person_creation_ts = now
-                            pid = label
-                            state.label = pid
+                            # Enforce cooldown between new ID creation
+                            if (now - self.last_person_creation_ts) >= self.cfg.embeddings.face_new_id_cooldown_s:
+                                # Only create if quality is acceptable
+                                if quality_score >= self.cfg.embeddings.min_face_quality:
+                                    label, created, match_score = self.face_store.match_or_create(
+                                        ref_emb,
+                                        prefix="P",
+                                        threshold=similarity_thresh,
+                                        force_threshold=similarity_thresh - force_margin,
+                                        create_threshold=create_thresh,
+                                        quality=quality_score,
+                                        image=fcrop,
+                                        save_dir=self.cfg.persistence.faces_dir if self.cfg.persistence.save_faces else None,
+                                    )
+                                    if created:
+                                        self.last_person_creation_ts = now
+                                        logger.info(f"Created new person ID: {label}")
+                                    pid = label
+                                    state.label = pid
+                                else:
+                                    # Low quality - fallback to best label or track ID
+                                    pid = best_label if best_label else f"P_{p.track_id:04d}"
+                                    state.consecutive_low_quality += 1
+                            else:
+                                # Cooldown active - prefer existing ID
+                                pid = best_label if best_label else state.label
                         else:
-                            # fallback to best known label even if low score to preserve identity
-                            pid = state.label if state.label else best_label
-                # fallback if still None
+                            # Still waiting for patience - use best available
+                            pid = best_label if best_label else state.label
+
+                # Fallback if still None
                 if pid is None:
                     pid = state.label if state.label else f"P_{p.track_id:04d}"
                 state.label = pid
             else:
                 # No face this frame; reuse previous ID if exists
                 pid = state.label if state.label else f"P_{p.track_id:04d}"
+                state.consecutive_low_quality = 0  # Reset counter when no face
 
             person_ids[p.track_id] = pid
             self.person_states[p.track_id] = state

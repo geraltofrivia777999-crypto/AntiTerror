@@ -25,18 +25,42 @@ class TrackingConfig:
 @dataclass
 class EmbeddingConfig:
     device: str = "cuda"
+    # FaceNet fallback model (used when InsightFace unavailable)
     face_model: str = "vggface2"  # facenet-pytorch pretrained set
-    face_confidence: float = 0.7
+
+    # InsightFace model selection
+    # Options: "buffalo_l" (best), "buffalo_m", "buffalo_s", "buffalo_sc"
+    # buffalo_l: ArcFace R100 - highest accuracy, recommended for production
+    # buffalo_s: ArcFace R34 - faster, good balance
+    face_model_name: str = "buffalo_l"
+
+    # Face detection parameters
+    face_confidence: float = 0.65  # slightly lower to catch more faces
     face_provider: str = "insightface"  # "insightface" | "facenet"
-    face_new_id_cooldown_s: float = 3.0
-    face_new_id_patience_frames: int = 3
-    face_switch_patience_frames: int = 3
+
+    # Quality filtering (reduces noise from bad detections)
+    min_face_size: int = 50  # minimum face size in pixels
+    min_face_quality: float = 0.3  # minimum overall quality score [0-1]
+
+    # ID creation timing (prevent rapid ID creation)
+    face_new_id_cooldown_s: float = 5.0  # increased from 3.0 to reduce duplicates
+    face_new_id_patience_frames: int = 5  # increased from 3 - wait longer before creating ID
+    face_switch_patience_frames: int = 5  # increased from 3 - more stable ID assignment
+
+    # Bag embedding config
     bag_model_name: str = "resnet50"
     bag_embedding_size: int = 2048
     bag_similarity_threshold: float = 0.7  # cosine similarity to attach to existing BagID
-    face_similarity_threshold: float = 0.8  # cosine similarity for PersonID reuse (stricter)
-    face_force_match_margin: float = 0.1  # allow reuse if score >= threshold - margin to reduce dup splits
-    face_create_threshold: float = 0.45  # lower barrier to reuse existing IDs
+
+    # Face matching thresholds - CRITICAL for reducing duplicates
+    # These are optimized for ArcFace/InsightFace embeddings
+    face_similarity_threshold: float = 0.55  # lowered from 0.8 - ArcFace scores are typically lower
+    face_force_match_margin: float = 0.15  # increased margin for more aggressive matching
+    face_create_threshold: float = 0.35  # lowered - prefer reusing existing IDs
+
+    # EMA smoothing parameters
+    ema_alpha: float = 0.7  # weight for old embedding (0.7*old + 0.3*new)
+    ema_quality_weighted: bool = True  # weight EMA by quality scores
 
 
 @dataclass

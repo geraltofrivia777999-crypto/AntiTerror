@@ -1,8 +1,11 @@
+"""Main pipeline for video processing with face-based tracking.
+
+This module now uses direct face tracking instead of person-body tracking
+for more accurate face recognition and reduced duplicate IDs.
+"""
 import argparse
-import signal
-import sys
 import time
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -13,52 +16,101 @@ from .association import AssociationEngine
 from .behavior import BehaviorAnalyzer
 from .config import PipelineConfig, select_device
 from .detection import Detector
-from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder
+from .embeddings import BagEmbedder, EmbeddingStore, FaceEmbedder, FaceQuality
 from .events import EventSink
+from .face_tracker import FaceTracker, FaceTrack
 from .tracking import Tracker
 from .video import open_video_source, read_frame, release
 
-from dataclasses import dataclass
-
-
-@dataclass
-class PersonState:
-    label: str | None = None
-    ema_emb: torch.Tensor | None = None
-    pending_label: str | None = None
-    pending_count: int = 0
-    init_frames: int = 0
-    last_seen: float = 0.0
-
 
 class Pipeline:
+    """Video processing pipeline with face-centric tracking.
+
+    Key changes from person-body tracking:
+    1. Faces are tracked directly (not extracted from person boxes)
+    2. Face bounding boxes are drawn instead of body boxes
+    3. FaceTracker handles re-identification with gallery matching
+    """
+
     def __init__(self, cfg: PipelineConfig):
-        # adjust device globally
+        # Adjust device globally
         cfg.detection.device = select_device(cfg.detection.device)
         cfg.embeddings.device = select_device(cfg.embeddings.device)
 
         self.cfg = cfg
+
+        # Object detection (for bags)
         self.detector = Detector(cfg.detection)
         self.tracker = Tracker(cfg.tracking)
-        self.bag_embedder = BagEmbedder(cfg.embeddings)
+
+        # Face detection and embedding
         self.face_embedder = FaceEmbedder(cfg.embeddings)
+
+        # Face-specific tracker with re-identification
+        self.face_tracker = FaceTracker(cfg.tracking, cfg.embeddings)
+
+        # Bag handling
+        self.bag_embedder = BagEmbedder(cfg.embeddings)
         self.bag_store = EmbeddingStore()
-        self.face_store = EmbeddingStore()
+
+        # Behavior analysis
         self.assoc = AssociationEngine(cfg.association)
         self.behavior = BehaviorAnalyzer(cfg.behavior)
         self.events = EventSink(cfg.events)
-        self.cap = open_video_source(cfg.video_source)
-        self.person_states: Dict[int, PersonState] = {}  # track_id -> state
-        self.last_person_creation_ts: float = 0.0
 
-    def process_frame(self, frame) -> None:
+        # Video source
+        self.cap = open_video_source(cfg.video_source)
+
+        # Store face boxes for association with bags
+        self.current_face_tracks: List[FaceTrack] = []
+
+        logger.info("Pipeline initialized with face-centric tracking")
+
+    def process_frame(self, frame: np.ndarray) -> None:
+        """Process a single video frame.
+
+        Pipeline:
+        1. Detect faces and extract embeddings
+        2. Track faces with FaceTracker (handles re-identification)
+        3. Detect and track bags (unchanged)
+        4. Associate faces with bags for behavior analysis
+        5. Render face boxes with IDs
+        """
+        # === Face Detection and Tracking ===
+        face_detections = self.face_embedder(frame)
+
+        if face_detections:
+            # Unpack face detections
+            face_boxes = np.array([fd[0] for fd in face_detections])
+            face_scores = np.array([fd[1] for fd in face_detections])
+            face_embeddings = [fd[2] for fd in face_detections]
+            face_crops = [fd[3] for fd in face_detections]
+            face_qualities = [fd[4].overall_quality for fd in face_detections]
+
+            # Update face tracker
+            self.current_face_tracks = self.face_tracker.update(
+                face_boxes=face_boxes,
+                face_scores=face_scores,
+                face_embeddings=face_embeddings,
+                face_qualities=face_qualities,
+                face_crops=face_crops
+            )
+        else:
+            # No faces detected - update tracker with empty
+            self.current_face_tracks = self.face_tracker.update(
+                face_boxes=np.array([]).reshape(0, 4),
+                face_scores=np.array([]),
+                face_embeddings=[],
+                face_qualities=[],
+                face_crops=[]
+            )
+
+        # === Bag Detection and Tracking ===
         detection = self.detector(frame)
         tracks = self.tracker.update(detection.boxes, detection.scores, detection.classes)
-
-        person_tracks = [t for t in tracks if t.cls in self.cfg.detection.classes_person]
         bag_tracks = [t for t in tracks if t.cls in self.cfg.detection.classes_bag]
 
-        # assign persistent IDs via embeddings
+        # Assign bag IDs via embeddings
         bag_ids: Dict[int, str] = {}
         for bag in bag_tracks:
             x1, y1, x2, y2 = bag.box.astype(int)
@@ -75,143 +127,148 @@ class Pipeline:
             )
             bag_ids[bag.track_id] = label
 
+        # === Association and Behavior ===
+        # Create person_ids dict from face tracks
         person_ids: Dict[int, str] = {}
-        faces = self.face_embedder(frame)
-        # match faces to person tracks by IoU of face bbox inside person bbox
-        for p in person_tracks:
-            state = self.person_states.get(p.track_id, PersonState())
-            state.init_frames += 1
-            state.last_seen = time.time()
+        for ft in self.current_face_tracks:
+            if ft.person_id:
+                person_ids[ft.track_id] = ft.person_id
 
-            pid = None
-            px1, py1, px2, py2 = p.box
-            # pick best face inside person box
-            candidates = []
-            for (fx1, fy1, fx2, fy2), fscore, femb, fcrop in faces:
-                if fx1 >= px1 and fy1 >= py1 and fx2 <= px2 and fy2 <= py2:
-                    candidates.append(((fx1, fy1, fx2, fy2), fscore, femb, fcrop))
-            if candidates:
-                (_, fscore, femb, fcrop) = max(candidates, key=lambda x: x[1])
-                # EMA embedding for stability
-                if state.ema_emb is None:
-                    state.ema_emb = femb
-                else:
-                    state.ema_emb = torch.nn.functional.normalize(0.8 * state.ema_emb + 0.2 * femb, dim=0)
-                ref_emb = state.ema_emb
+        # Associate faces with bags (using face center as person position)
+        assignments = self._associate_faces_bags(self.current_face_tracks, bag_tracks)
 
-                best_label, best_score = self.face_store.find_best(ref_emb)
-
-                # Decide candidate label without creating new IDs eagerly
-                if state.label:
-                    pid = state.label
-                    ref_vec = self.face_store.get_vector(state.label)
-                    score_current = float(
-                        torch.nn.functional.cosine_similarity(ref_emb.unsqueeze(0), ref_vec.unsqueeze(0)).item()
-                    ) if ref_vec is not None else 0.0
-                    if score_current < self.cfg.embeddings.face_similarity_threshold - self.cfg.embeddings.face_force_match_margin:
-                        # consider switch if consistent over several frames
-                        if best_label and best_score >= self.cfg.embeddings.face_similarity_threshold - self.cfg.embeddings.face_force_match_margin:
-                            if state.pending_label == best_label:
-                                state.pending_count += 1
-                            else:
-                                state.pending_label = best_label
-                                state.pending_count = 1
-                            if state.pending_count >= self.cfg.embeddings.face_switch_patience_frames:
-                                pid = best_label
-                                state.label = pid
-                                state.pending_label = None
-                                state.pending_count = 0
-                        else:
-                            state.pending_label = None
-                            state.pending_count = 0
-                else:
-                    # no label yet, gate creation by patience and score
-                    if best_label and best_score >= self.cfg.embeddings.face_similarity_threshold:
-                        pid = best_label
-                        state.label = pid
-                    elif best_label and best_score >= (self.cfg.embeddings.face_create_threshold - 0.05):
-                        # reuse existing best label even если чуть ниже create_threshold
-                        pid = best_label
-                        state.label = pid
-                    else:
-                        # only create new ID if patience satisfied and score good enough
-                        if (
-                            state.init_frames >= self.cfg.embeddings.face_new_id_patience_frames
-                            and best_score >= self.cfg.embeddings.face_create_threshold
-                        ):
-                            label, created, _ = self.face_store.match_or_create(
-                                ref_emb,
-                                prefix="P",
-                                threshold=self.cfg.embeddings.face_similarity_threshold,
-                                force_threshold=self.cfg.embeddings.face_similarity_threshold
-                                - self.cfg.embeddings.face_force_match_margin,
-                                create_threshold=self.cfg.embeddings.face_create_threshold,
-                                image=fcrop,
-                                save_dir=self.cfg.persistence.faces_dir if self.cfg.persistence.save_faces else None,
-                            )
-                            now = time.time()
-                            if created and (now - self.last_person_creation_ts) < self.cfg.embeddings.face_new_id_cooldown_s and best_label:
-                                label = best_label
-                                created = False
-                            if created:
-                                self.last_person_creation_ts = now
-                            pid = label
-                            state.label = pid
-                        else:
-                            # fallback to best known label even if low score to preserve identity
-                            pid = state.label if state.label else best_label
-                # fallback if still None
-                if pid is None:
-                    pid = state.label if state.label else f"P_{p.track_id:04d}"
-                state.label = pid
-            else:
-                # No face this frame; reuse previous ID if exists
-                pid = state.label if state.label else f"P_{p.track_id:04d}"
-
-            person_ids[p.track_id] = pid
-            self.person_states[p.track_id] = state
-
-        # prune stale person track states
-        current_ids = {p.track_id for p in person_tracks}
-        for tid in list(self.person_states.keys()):
-            if tid not in current_ids:
-                del self.person_states[tid]
-
-        assignments = self.assoc.associate(person_tracks, bag_tracks)
+        # Behavior analysis
         events = self.behavior.update(bag_tracks, bag_ids, person_ids, assignments)
         if events:
             self.events.emit(events)
 
-        self._render(frame, person_tracks, bag_tracks, bag_ids, person_ids, assignments)
+        # === Render ===
+        self._render(frame, self.current_face_tracks, bag_tracks, bag_ids, assignments)
 
-    def _render(self, frame, person_tracks, bag_tracks, bag_ids, person_ids, assignments):
-        # lightweight on-frame debug overlay
-        for p in person_tracks:
-            x1, y1, x2, y2 = map(int, p.box)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = person_ids.get(p.track_id, f"P{p.track_id}")
-            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        for b in bag_tracks:
-            x1, y1, x2, y2 = map(int, b.box)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            label = bag_ids.get(b.track_id, f"B{b.track_id}")
-            owner = assignments.get(b.track_id)
-            owner_label = person_ids.get(owner, "?") if owner is not None else "?"
+    def _associate_faces_bags(
+        self,
+        face_tracks: List[FaceTrack],
+        bag_tracks: List
+    ) -> Dict[int, int]:
+        """Associate bags with nearest face.
+
+        Simple distance-based association using face center.
+        """
+        assignments: Dict[int, int] = {}  # bag_track_id -> face_track_id
+
+        if not face_tracks or not bag_tracks:
+            return assignments
+
+        for bag in bag_tracks:
+            bx = (bag.box[0] + bag.box[2]) / 2
+            by = (bag.box[1] + bag.box[3]) / 2
+
+            best_face = None
+            best_dist = float('inf')
+
+            for ft in face_tracks:
+                if ft.person_id is None:
+                    continue
+                # Face center (use bottom of face as approximate shoulder level)
+                fx = (ft.box[0] + ft.box[2]) / 2
+                fy = ft.box[3]  # Bottom of face
+
+                dist = np.sqrt((fx - bx) ** 2 + (fy - by) ** 2)
+                if dist < best_dist and dist < self.cfg.association.max_link_distance_px * 2:
+                    best_dist = dist
+                    best_face = ft
+
+            if best_face:
+                assignments[bag.track_id] = best_face.track_id
+
+        return assignments
+
+    def _render(
+        self,
+        frame: np.ndarray,
+        face_tracks: List[FaceTrack],
+        bag_tracks: List,
+        bag_ids: Dict[int, str],
+        assignments: Dict[int, int]
+    ) -> None:
+        """Render face boxes and bag boxes on frame.
+
+        Only draws face bounding boxes (not full body).
+        """
+        # Draw face boxes
+        for ft in face_tracks:
+            x1, y1, x2, y2 = map(int, ft.box)
+
+            # Color based on ID status
+            if ft.person_id:
+                color = (0, 255, 0)  # Green - has ID
+            else:
+                color = (0, 255, 255)  # Yellow - pending ID
+
+            # Draw face rectangle
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Draw label
+            label = ft.person_id if ft.person_id else f"?{ft.track_id}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+
+            # Background for text
+            cv2.rectangle(
+                frame,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0] + 5, y1),
+                color,
+                -1
+            )
             cv2.putText(
                 frame,
-                f"{label}-> {owner_label}",
-                (x1, y1 - 5),
+                label,
+                (x1 + 2, y1 - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (0, 165, 255),
-                2,
+                (0, 0, 0),  # Black text on colored background
+                2
             )
-        cv2.imshow("AntiTerror MVP", frame)
+
+        # Draw bag boxes
+        for bag in bag_tracks:
+            x1, y1, x2, y2 = map(int, bag.box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
+
+            bag_label = bag_ids.get(bag.track_id, f"B{bag.track_id}")
+
+            # Find owner
+            owner_track_id = assignments.get(bag.track_id)
+            owner_label = "?"
+            if owner_track_id:
+                for ft in face_tracks:
+                    if ft.track_id == owner_track_id and ft.person_id:
+                        owner_label = ft.person_id
+                        break
+
+            text = f"{bag_label}->{owner_label}"
+            cv2.putText(
+                frame,
+                text,
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 165, 255),
+                2
+            )
+
+        # Show stats
+        num_ids = len(self.face_tracker.gallery.get_all_ids())
+        stats_text = f"Faces: {len(face_tracks)} | IDs: {num_ids}"
+        cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow("AntiTerror - Face Tracking", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             raise KeyboardInterrupt
 
-    def run(self):
-        logger.info("Starting pipeline. Press 'q' to exit.")
+    def run(self) -> None:
+        """Run the pipeline on video source."""
+        logger.info("Starting face-centric pipeline. Press 'q' to exit.")
         try:
             while True:
                 frame = read_frame(self.cap)
@@ -223,10 +280,13 @@ class Pipeline:
         finally:
             release(self.cap)
             cv2.destroyAllWindows()
+            # Log final stats
+            num_ids = len(self.face_tracker.gallery.get_all_ids())
+            logger.info(f"Final identity count: {num_ids}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Anti-terror video analytics MVP")
+    parser = argparse.ArgumentParser(description="Anti-terror video analytics with face tracking")
     parser.add_argument("--source", type=str, default="0", help="Video source (index or path)")
     parser.add_argument("--camera-id", type=str, default="CAM_01", help="Camera identifier")
     parser.add_argument("--conf", type=float, default=None, help="Detection confidence override")
@@ -243,6 +303,7 @@ def main():
         cfg.detection.conf_threshold = args.conf
     if args.abandonment_timeout is not None:
         cfg.behavior.abandonment_timeout_s = args.abandonment_timeout
+
     pipeline = Pipeline(cfg)
     pipeline.run()
 

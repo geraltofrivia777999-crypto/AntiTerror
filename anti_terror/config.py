@@ -4,12 +4,30 @@ from pathlib import Path
 
 @dataclass
 class DetectionConfig:
-    model_path: str = "yolov8s.pt"  # a bit heavier than nano for better bag/person fidelity
-    conf_threshold: float = 0.35
+    # Model selection - YOLO11x is the most accurate
+    # Options: "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt"
+    # Or YOLOv8: "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"
+    model_path: str = "yolo11x.pt"  # Best accuracy, use "yolo11s.pt" for speed
+
+    # Detection thresholds
+    conf_threshold: float = 0.35  # For persons
+    bag_conf_threshold: float = 0.20  # Lower threshold for bags (harder to detect)
     iou_threshold: float = 0.45
+
+    # Input size - larger = better small object detection
+    imgsz: int = 640  # Can increase to 1280 for better accuracy (slower)
+
+    # Test-time augmentation - improves accuracy at cost of speed
+    augment: bool = True
+
     device: str = "cuda"  # fallback handled at runtime
-    classes_person: tuple[int, ...] = (0,)  # COCO: person
-    classes_bag: tuple[int, ...] = (24, 26, 28)  # backpack, handbag, suitcase
+
+    # COCO classes
+    classes_person: tuple[int, ...] = (0,)  # person
+
+    # Bag classes - expanded for better coverage
+    # 24=backpack, 26=handbag, 28=suitcase
+    classes_bag: tuple[int, ...] = (24, 26, 28)
 
 
 @dataclass
